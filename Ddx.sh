@@ -14,12 +14,16 @@
 # Compression always runs on the "smart" side so the SSH wire carries
 # compressed data whenever possible.
 #
+# SSH auth per endpoint: agent/config defaults, key file, or password
+# (via sshpass). Connection multiplexing (ControlMaster) means you
+# authenticate ONCE per host per run, no matter how many checks run.
+#
 # https://github.com/<your-user>/ddx
 # License: MIT
 #
 set -o errexit -o nounset -o pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 SELF="$(basename "$0")"
 
 # ---------------------------------------------------------------- colors ----
@@ -42,13 +46,20 @@ COMP=""            # none|gzip|pigz|zstd|xz|lz4  ("" = auto/ask)
 LEVEL=""           # compression level ("" = default per tool)
 BS="4M"
 SSH_PORT="" SSH_KEY=""
-WIRE="auto"        # transfer compression for raw disk->disk over ssh: auto|none|gzip|zstd|lz4
+WIRE="auto"        # transfer compression for raw disk->disk over ssh
 CHECKSUM=0
 DRY_RUN=0
 ASSUME_YES=0
 REMOTE_SUDO=0
+ASK_PASS=0
 LIST_TARGET=""
 DO_LIST=0
+
+# per-endpoint SSH auth (filled by the wizard or --ask-pass / -i)
+# shellcheck disable=SC2034  # referenced indirectly via ${!var}
+SRC_HOST="" SRC_KEY="" SRC_PASS=""
+# shellcheck disable=SC2034
+DST_HOST="" DST_KEY="" DST_PASS=""
 
 usage() {
 cat <<EOF
@@ -78,7 +89,9 @@ ${C_BOLD}OPTIONS${C_N}
                           xz 0-9, lz4 1-12)
   -b, --bs SIZE           dd block size (default: 4M)
   -p, --ssh-port PORT     SSH port for remote endpoints
-  -i, --ssh-key FILE      SSH identity file
+  -i, --ssh-key FILE      SSH identity file (applies to all remote hosts)
+  -P, --ask-pass          prompt for SSH password(s) for remote hosts
+                          (uses sshpass; hidden input, never on the cmdline)
       --wire MODE         transfer compression for RAW streams over SSH
                           (disk->disk): auto|none|gzip|zstd|lz4 (default: auto)
       --remote-sudo       prefix remote dd with 'sudo -n' (needs NOPASSWD)
@@ -89,15 +102,21 @@ ${C_BOLD}OPTIONS${C_N}
   -h, --help              this help
   -V, --version           print version
 
+${C_BOLD}SSH AUTHENTICATION${C_N}
+  The wizard asks per remote host: (d)efault agent/~/.ssh/config,
+  (k)ey file, or (p)assword. Password auth uses 'sshpass' if installed;
+  without it, ssh prompts you interactively - but thanks to connection
+  multiplexing you only type it ONCE per host either way.
+
 ${C_BOLD}EXAMPLES${C_N}
   # backup local disk to compressed local image
   $SELF -s /dev/sda -d ./sda.img.zst -c zstd -l 3
 
-  # backup local disk straight to a remote server
-  $SELF -s /dev/sda -d root@10.0.0.5:/backup/web1-sda.img.gz -c gzip -l 6
+  # backup local disk straight to a remote server (password auth)
+  $SELF -s /dev/sda -d root@10.0.0.5:/backup/web1.img.gz -c gzip -P
 
-  # pull a remote server's disk down to a local image
-  $SELF -s root@10.0.0.5:/dev/sda -d ./web1.img.zst
+  # pull a remote server's disk down to a local image (key auth)
+  $SELF -s root@10.0.0.5:/dev/sda -d ./web1.img.zst -i ~/.ssh/backup_key
 
   # restore an image onto a remote server's disk
   $SELF -s ./web1.img.zst -d root@10.0.0.9:/dev/sda
@@ -120,6 +139,7 @@ while [[ $# -gt 0 ]]; do
     -b|--bs)          BS="${2:?}"; shift 2;;
     -p|--ssh-port)    SSH_PORT="${2:?}"; shift 2;;
     -i|--ssh-key)     SSH_KEY="${2:?}"; shift 2;;
+    -P|--ask-pass)    ASK_PASS=1; shift;;
     --wire)           WIRE="${2:?}"; shift 2;;
     --remote-sudo)    REMOTE_SUDO=1; shift;;
     --checksum)       CHECKSUM=1; shift;;
@@ -134,14 +154,53 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# --------------------------------------------------------------- ssh args ---
-SSH_STR="ssh -o Compression=no"
-[[ -n "$SSH_PORT" ]] && SSH_STR+=" -p $(q "$SSH_PORT")"
-[[ -n "$SSH_KEY"  ]] && SSH_STR+=" -i $(q "$SSH_KEY")"
+# --------------------------------------------- ssh base + multiplexing ------
+CTL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ddx-ssh.XXXXXX")"
+cleanup() {
+  local p hv h
+  for p in SRC DST; do
+    hv="${p}_HOST"; h="${!hv-}"
+    if [[ -n "$h" ]]; then
+      # shellcheck disable=SC2086
+      eval "$(ssh_for "$p") -O exit $(q "$h")" >/dev/null 2>&1 || true
+    fi
+  done
+  rm -rf "$CTL_DIR"
+}
+trap cleanup EXIT
 
-remote_run() { # host, command-string
+SSH_BASE="ssh -o Compression=no -o ConnectTimeout=10"
+SSH_BASE+=" -o ControlMaster=auto -o ControlPath=$(q "$CTL_DIR")/%C -o ControlPersist=60"
+[[ -n "$SSH_PORT" ]] && SSH_BASE+=" -p $(q "$SSH_PORT")"
+[[ -n "$SSH_KEY"  ]] && SSH_BASE+=" -i $(q "$SSH_KEY")"
+
+# full ssh invocation prefix for one endpoint (SRC|DST), without the host
+ssh_for() {
+  local p="$1"
+  local kv="${p}_KEY" pv="${p}_PASS"
+  local key="${!kv-}" pass="${!pv-}" s="$SSH_BASE"
+  [[ -n "$key" ]] && s+=" -i $(q "$key")"
+  if [[ -n "$pass" ]] && have sshpass; then
+    s="SSHPASS=$(q "$pass") sshpass -e $s"
+  fi
+  echo "$s"
+}
+
+remote_run() { # SRC|DST, command-string
+  local p="$1" hv="${1}_HOST"; local host="${!hv}"
   # shellcheck disable=SC2086
-  eval "$SSH_STR $(q "$1") $(q "$2")"
+  eval "$(ssh_for "$p") $(q "$host") $(q "$2")"
+}
+
+read_password() { # SRC|DST host
+  local p="$1" host="$2" pw
+  if ! have sshpass; then
+    warn "sshpass is not installed - ssh itself will ask for the password of $host"
+    warn "(only once, thanks to connection sharing). To avoid prompts: apt install sshpass"
+    return 0
+  fi
+  read -rsp "${C_B}?${C_N} SSH password for $host: " pw >&2; echo >&2
+  printf -v "${p}_PASS" '%s' "$pw"
 }
 
 # ------------------------------------------------------------- disk lists ---
@@ -149,16 +208,34 @@ list_disks_local() {
   echo "${C_BOLD}Local disks:${C_N}"
   lsblk -d -o NAME,SIZE,TYPE,MODEL,SERIAL 2>/dev/null || lsblk -d
 }
-list_disks_remote() {
-  echo "${C_BOLD}Disks on $1:${C_N}"
-  remote_run "$1" "lsblk -d -o NAME,SIZE,TYPE,MODEL 2>/dev/null || lsblk -d" || warn "could not list disks on $1"
+list_disks_remote() { # SRC|DST
+  local hv="${1}_HOST"
+  echo "${C_BOLD}Disks on ${!hv}:${C_N}"
+  remote_run "$1" "lsblk -d -o NAME,SIZE,TYPE,MODEL 2>/dev/null || lsblk -d" \
+    || warn "could not list disks on ${!hv}"
 }
 if [[ $DO_LIST -eq 1 ]]; then
-  if [[ -n "$LIST_TARGET" ]]; then list_disks_remote "$LIST_TARGET"; else list_disks_local; fi
+  if [[ -n "$LIST_TARGET" ]]; then
+    SRC_HOST="$LIST_TARGET"
+    [[ $ASK_PASS -eq 1 ]] && read_password SRC "$SRC_HOST"
+    list_disks_remote SRC
+  else
+    list_disks_local
+  fi
   exit 0
 fi
 
 # ------------------------------------------------------ endpoint parsing ----
+comp_from_ext() {
+  case "$1" in
+    *.gz)  echo gzip;;
+    *.zst) echo zstd;;
+    *.xz)  echo xz;;
+    *.lz4) echo lz4;;
+    *)     echo none;;
+  esac
+}
+
 # sets: <P>_HOST <P>_PATH <P>_REMOTE(0/1) <P>_DISK(0/1) <P>_COMP(ext-detected)
 parse_endpoint() {
   local spec="$1" p="$2" host="" path=""
@@ -175,16 +252,6 @@ parse_endpoint() {
   printf -v "${p}_REMOTE" '%s' "$remote"
   printf -v "${p}_DISK"   '%s' "$disk"
   printf -v "${p}_COMP"   '%s' "$(comp_from_ext "$path")"
-}
-
-comp_from_ext() {
-  case "$1" in
-    *.gz)  echo gzip;;
-    *.zst) echo zstd;;
-    *.xz)  echo xz;;
-    *.lz4) echo lz4;;
-    *)     echo none;;
-  esac
 }
 
 ext_for_comp() {
@@ -237,8 +304,7 @@ decomp_cmd() { # family (gz produced by gzip OR pigz)
   esac
 }
 
-# decompressor name to use on a given side; on remote side we can't know
-# if pigz exists without asking, so remote decompression uses the portable tool
+# remote side: use only the portable tool names
 decomp_cmd_remote() {
   case "$1" in
     gzip|pigz) echo "gzip -dc";;
@@ -271,8 +337,10 @@ human_size() {
     while (b>=1024 && i<6) { b/=1024; i++ } printf "%.1f%s", b, u[i] }'
 }
 
-get_size_bytes() { # remote(0/1) host path disk(0/1) -> bytes or ""
-  local remote="$1" host="$2" path="$3" disk="$4" out=""
+get_size_bytes() { # SRC|DST -> bytes or ""
+  local p="$1"
+  local rv="${p}_REMOTE" pv2="${p}_PATH" dv="${p}_DISK"
+  local remote="${!rv}" path="${!pv2}" disk="${!dv}" out=""
   if [[ "$remote" -eq 0 ]]; then
     if [[ "$disk" -eq 1 ]]; then
       out="$(blockdev --getsize64 "$path" 2>/dev/null || lsblk -bdno SIZE "$path" 2>/dev/null | head -1 || true)"
@@ -281,9 +349,9 @@ get_size_bytes() { # remote(0/1) host path disk(0/1) -> bytes or ""
     fi
   else
     if [[ "$disk" -eq 1 ]]; then
-      out="$(remote_run "$host" "blockdev --getsize64 $(q "$path") 2>/dev/null || lsblk -bdno SIZE $(q "$path") 2>/dev/null | head -1" 2>/dev/null || true)"
+      out="$(remote_run "$p" "blockdev --getsize64 $(q "$path") 2>/dev/null || lsblk -bdno SIZE $(q "$path") 2>/dev/null | head -1" 2>/dev/null || true)"
     else
-      out="$(remote_run "$host" "stat -c %s $(q "$path") 2>/dev/null" 2>/dev/null || true)"
+      out="$(remote_run "$p" "stat -c %s $(q "$path") 2>/dev/null" 2>/dev/null || true)"
     fi
   fi
   [[ "$out" =~ ^[0-9]+$ ]] && echo "$out" || echo ""
@@ -296,19 +364,21 @@ check_mounted_local() { # path -> dies if mounted
   fi
 }
 
-check_mounted_remote() { # host path -> warns
-  if remote_run "$1" "lsblk -no MOUNTPOINT $(q "$2") 2>/dev/null | grep -q '[^[:space:]]'" 2>/dev/null; then
+check_mounted_remote() { # SRC|DST
+  local hv="${1}_HOST" pv2="${1}_PATH"
+  if remote_run "$1" "lsblk -no MOUNTPOINT $(q "${!pv2}") 2>/dev/null | grep -q '[^[:space:]]'" 2>/dev/null; then
     if [[ $ASSUME_YES -eq 1 ]]; then
-      warn "$2 on $1 appears to be MOUNTED - continuing because of --yes"
+      warn "${!pv2} on ${!hv} appears to be MOUNTED - continuing because of --yes"
     else
-      die "$2 on $1 (or one of its partitions) is MOUNTED. Unmount it first."
+      die "${!pv2} on ${!hv} (or one of its partitions) is MOUNTED. Unmount it first."
     fi
   fi
 }
 
-check_remote_tool() { # host tool
+check_remote_tool() { # SRC|DST tool
+  local hv="${1}_HOST"
   remote_run "$1" "command -v $(q "$2") >/dev/null 2>&1" \
-    || die "'$2' is not installed on $1 - install it there first (or choose another compression)"
+    || die "'$2' is not installed on ${!hv} - install it there first (or choose another compression)"
 }
 
 confirm_disk_write() { # human-target-description device-path
@@ -322,48 +392,77 @@ confirm_disk_write() { # human-target-description device-path
 }
 
 # ---------------------------------------------------------------- wizard ----
-wizard_endpoint() { # role(source|dest) -> echoes spec
-  local role="$1" spec="" host="" hp="" kind loc
+wizard_endpoint() { # P(SRC|DST) role-label -> sets WIZ_SPEC + ${P}_* auth vars
+  local P="$1" role="$2" spec="" host="" hp="" kind loc auth keyfile def
   echo >&2
   echo "${C_BOLD}--- ${role^^} ---${C_N}" >&2
   loc="$(ask "Is the $role LOCAL or REMOTE? (l/r)" "l")"
   if [[ "$loc" =~ ^[Rr] ]]; then
     host="$(ask "Remote SSH target (user@host)")"
     [[ -n "$host" ]] || die "no host given"
+    printf -v "${P}_HOST" '%s' "$host"
     if [[ -z "$SSH_PORT" ]]; then
       hp="$(ask "SSH port" "22")"
-      [[ "$hp" != "22" ]] && { SSH_PORT="$hp"; SSH_STR+=" -p $(q "$SSH_PORT")"; }
+      if [[ "$hp" != "22" ]]; then
+        SSH_PORT="$hp"; SSH_BASE+=" -p $(q "$SSH_PORT")"
+      fi
     fi
+    # --- authentication ---
+    auth="$(ask "SSH auth for $host: (d)efault agent/config, (k)ey file, (p)assword" "d")"
+    case "$auth" in
+      [Kk]*)
+        def=""
+        for f in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa" "$HOME/.ssh/id_ecdsa"; do
+          [[ -f "$f" ]] && { def="$f"; break; }
+        done
+        keyfile="$(ask "Path to private key" "$def")"
+        [[ -f "$keyfile" ]] || die "key file not found: $keyfile"
+        printf -v "${P}_KEY" '%s' "$keyfile"
+        ;;
+      [Pp]*)
+        read_password "$P" "$host"
+        ;;
+      *) : ;;  # default: agent / ~/.ssh/config
+    esac
   fi
   kind="$(ask "Is the $role a DISK (block device) or an IMAGE file? (d/i)" "d")"
   if [[ "$kind" =~ ^[Dd] ]]; then
-    if [[ -n "$host" ]]; then list_disks_remote "$host" >&2 || true; else list_disks_local >&2; fi
+    if [[ -n "$host" ]]; then list_disks_remote "$P" >&2 || true; else list_disks_local >&2; fi
     local dev; dev="$(ask "Device path (e.g. /dev/sda)")"
     [[ "$dev" == /dev/* ]] || die "a disk must be under /dev/"
     spec="$dev"
   else
-    local f; f="$(ask "Image file path (e.g. ./sda.img.zst)")"
-    [[ -n "$f" ]] || die "no path given"
-    spec="$f"
+    local f2; f2="$(ask "Image file path (e.g. ./sda.img.zst)")"
+    [[ -n "$f2" ]] || die "no path given"
+    spec="$f2"
   fi
   [[ -n "$host" ]] && spec="$host:$spec"
-  echo "$spec"
+  WIZ_SPEC="$spec"
 }
 
 run_wizard() {
   echo "${C_BOLD}ddx v$VERSION - universal dd imaging & cloning wizard${C_N}" >&2
   echo "Answer a few questions and gooo." >&2
-  SRC_SPEC="$(wizard_endpoint "source")"
-  DST_SPEC="$(wizard_endpoint "destination")"
+  wizard_endpoint SRC "source";      SRC_SPEC="$WIZ_SPEC"
+  wizard_endpoint DST "destination"; DST_SPEC="$WIZ_SPEC"
 }
 
 # =================================================================== MAIN ===
-[[ -z "$SRC_SPEC" && -z "$DST_SPEC" ]] && run_wizard
+WIZARD_USED=0
+if [[ -z "$SRC_SPEC" && -z "$DST_SPEC" ]]; then WIZARD_USED=1; run_wizard; fi
 [[ -n "$SRC_SPEC" ]] || die "no source given (use -s or run the wizard)"
 [[ -n "$DST_SPEC" ]] || die "no destination given (use -d or run the wizard)"
 
 parse_endpoint "$SRC_SPEC" SRC
 parse_endpoint "$DST_SPEC" DST
+
+# --ask-pass for CLI mode: prompt per remote host (skip if wizard already did)
+if [[ $ASK_PASS -eq 1 && $WIZARD_USED -eq 0 ]]; then
+  [[ $SRC_REMOTE -eq 1 && -z "$SRC_PASS" ]] && read_password SRC "$SRC_HOST"
+  if [[ $DST_REMOTE -eq 1 && -z "$DST_PASS" ]]; then
+    if [[ "$DST_HOST" == "$SRC_HOST" ]]; then DST_PASS="$SRC_PASS"; else read_password DST "$DST_HOST"; fi
+  fi
+fi
 
 # sanity
 [[ "$SRC_SPEC" == "$DST_SPEC" ]] && die "source and destination are the same"
@@ -377,15 +476,29 @@ if [[ $DST_REMOTE -eq 0 && $DST_DISK -eq 1 && ! -b "$DST_PATH" ]]; then
   die "destination is not a block device: $DST_PATH"
 fi
 
+# ---------------------------------------------------------- ssh preflight ---
+# connect early: opens the ControlMaster so every later ssh call (size probe,
+# tool checks, mkdir, the pipeline itself) reuses ONE authenticated session
+preflight_ssh() { # SRC|DST
+  local hv="${1}_HOST"
+  log "connecting to ${!hv} ..."
+  remote_run "$1" "true" >/dev/null \
+    || die "cannot connect to ${!hv} via SSH - check host, port (-p), key/password and firewall"
+}
+if [[ $DRY_RUN -eq 0 ]]; then
+  [[ $SRC_REMOTE -eq 1 ]] && preflight_ssh SRC
+  if [[ $DST_REMOTE -eq 1 && "$DST_HOST" != "$SRC_HOST" ]]; then preflight_ssh DST; fi
+  if [[ $DST_REMOTE -eq 1 && "$DST_HOST" == "$SRC_HOST" && $SRC_REMOTE -eq 0 ]]; then preflight_ssh DST; fi
+fi
+
 # ------------------------------------------ choose compression for images ---
 if [[ $DST_DISK -eq 0 ]]; then
   if [[ -z "$COMP" ]]; then
     if [[ "$DST_COMP" != "none" ]]; then
       COMP="$DST_COMP"
-    elif [[ -z "$SRC_SPEC" || $DRY_RUN -eq 1 || $ASSUME_YES -eq 1 ]]; then
+    elif [[ $DRY_RUN -eq 1 || $ASSUME_YES -eq 1 ]]; then
       COMP="none"
     else
-      # interactive choice
       avail="none gzip"
       have pigz && avail+=" pigz"
       have zstd && avail+=" zstd"
@@ -406,7 +519,6 @@ if [[ $DST_DISK -eq 0 ]]; then
     fi
     [[ "$LEVEL" =~ ^[0-9]+$ ]] || die "compression level must be a number"
   fi
-  # warn about mismatched extension
   want_ext="$(ext_for_comp "$COMP")"
   if [[ -n "$want_ext" && "$DST_PATH" != *"$want_ext" ]]; then
     warn "destination '$DST_PATH' does not end in $want_ext - restore will rely on you remembering the format"
@@ -424,14 +536,12 @@ if [[ "$COMP" != "none" ]]; then
 fi
 
 # ---------------------------------------------------- build the pipeline ----
-# stream_comp = compression of the byte stream as it leaves the producer
 stream_comp="none"
 [[ $SRC_DISK -eq 0 ]] && stream_comp="$SRC_COMP"
 
 producer=""; src_filters=(); dst_filters=(); consumer=""
 crossing_ssh=$(( SRC_REMOTE || DST_REMOTE ))
 
-# producer (runs on the source side)
 if [[ $SRC_DISK -eq 1 ]]; then
   producer="dd if=$(q "$SRC_PATH") bs=$(q "$BS") status=none"
   [[ $SRC_REMOTE -eq 1 && $REMOTE_SUDO -eq 1 ]] && producer="sudo -n $producer"
@@ -440,8 +550,6 @@ else
 fi
 
 if [[ $DST_DISK -eq 1 ]]; then
-  # destination needs RAW; decompress on the destination side so the SSH
-  # wire carries compressed bytes
   if [[ "$stream_comp" != "none" ]]; then
     if [[ $DST_REMOTE -eq 1 ]]; then
       dst_filters+=("$(decomp_cmd_remote "$stream_comp")")
@@ -449,14 +557,12 @@ if [[ $DST_DISK -eq 1 ]]; then
       dst_filters+=("$(decomp_cmd "$stream_comp")")
     fi
   elif [[ $crossing_ssh -eq 1 && "$WIRE" != "none" ]]; then
-    # raw stream over the network: optional transfer compression
     wsel="$WIRE"
     if [[ "$wsel" == "auto" ]]; then
       if have zstd; then wsel="zstd"; elif have lz4; then wsel="lz4"; else wsel="gzip"; fi
     fi
     case "$wsel" in gzip|zstd|lz4) ;; *) die "--wire must be auto|none|gzip|zstd|lz4";; esac
-    wlevel=1
-    src_filters+=("$(comp_cmd "$wsel" "$wlevel")")
+    src_filters+=("$(comp_cmd "$wsel" 1)")
     if [[ $DST_REMOTE -eq 1 ]]; then
       dst_filters+=("$(decomp_cmd_remote "$wsel")")
     else
@@ -467,9 +573,7 @@ if [[ $DST_DISK -eq 1 ]]; then
   consumer="dd of=$(q "$DST_PATH") bs=$(q "$BS") iflag=fullblock conv=fsync status=none"
   [[ $DST_REMOTE -eq 1 && $REMOTE_SUDO -eq 1 ]] && consumer="sudo -n $consumer"
 else
-  # destination is an image with target compression $COMP
   if [[ "$stream_comp" != "$COMP" ]]; then
-    # transcode on the SOURCE side so the wire carries the final format
     if [[ "$stream_comp" != "none" ]]; then
       if [[ $SRC_REMOTE -eq 1 ]]; then
         src_filters+=("$(decomp_cmd_remote "$stream_comp")")
@@ -484,15 +588,15 @@ else
   consumer="cat > $(q "$DST_PATH")"
 fi
 
-# remote tool checks (best effort, before we start writing anything)
+# remote tool checks (cheap now - they reuse the multiplexed connection)
 if [[ $DRY_RUN -eq 0 && $SRC_REMOTE -eq 1 ]]; then
   for f in "${src_filters[@]}"; do
-    check_remote_tool "$SRC_HOST" "${f%% *}"
+    check_remote_tool SRC "${f%% *}"
   done
 fi
 if [[ $DRY_RUN -eq 0 && $DST_REMOTE -eq 1 ]]; then
   for f in "${dst_filters[@]}"; do
-    check_remote_tool "$DST_HOST" "${f%% *}"
+    check_remote_tool DST "${f%% *}"
   done
 fi
 
@@ -500,7 +604,7 @@ fi
 left="$producer"
 for f in "${src_filters[@]}"; do left+=" | $f"; done
 if [[ $SRC_REMOTE -eq 1 ]]; then
-  left="$SSH_STR $(q "$SRC_HOST") $(q "$left")"
+  left="$(ssh_for SRC) $(q "$SRC_HOST") $(q "$left")"
 fi
 
 # assemble right (destination side)
@@ -511,22 +615,19 @@ for f in "${dst_filters[@]}"; do
 done
 if [[ -n "$right" ]]; then right+=" | $consumer"; else right="$consumer"; fi
 if [[ $DST_REMOTE -eq 1 ]]; then
-  right="$SSH_STR $(q "$DST_HOST") $(q "$right")"
+  right="$(ssh_for DST) $(q "$DST_HOST") $(q "$right")"
 fi
 
 # local middle: progress + optional checksum
 middle=()
 src_bytes=""
 if [[ $DRY_RUN -eq 0 || $SRC_REMOTE -eq 0 ]]; then
-  src_bytes="$(get_size_bytes "$SRC_REMOTE" "$SRC_HOST" "$SRC_PATH" "$SRC_DISK")"
+  src_bytes="$(get_size_bytes SRC)"
 fi
 
 pv_size_known=0
 if [[ -n "$src_bytes" ]]; then
-  # pv sits right after the stream enters the local machine; size is only
-  # meaningful if no source-side transform changed the byte count
   if [[ ${#src_filters[@]} -eq 0 ]]; then pv_size_known=1; fi
-  # ...unless source is local: then pv can go BEFORE local src filters
   if [[ $SRC_REMOTE -eq 0 ]]; then pv_size_known=1; fi
 fi
 
@@ -548,13 +649,12 @@ if [[ $CHECKSUM -eq 1 ]]; then
   fi
 fi
 
-# position of pv: if source is local, put pv straight after the raw producer
-# (before local compression) so -s matches; easiest correct assembly:
-if [[ $SRC_REMOTE -eq 0 && ${#src_filters[@]} -gt 0 && "$(have pv && echo 1)" == "1" ]]; then
-  # rebuild left with pv injected after producer
+# if source is local and has local filters, put pv right after the raw
+# producer so -s matches the raw byte count
+if [[ $SRC_REMOTE -eq 0 && ${#src_filters[@]} -gt 0 ]] && have pv; then
   left="$producer | ${middle[0]}"
   for f in "${src_filters[@]}"; do left+=" | $f"; done
-  middle=("${middle[@]:1}")   # pv consumed
+  middle=("${middle[@]:1}")
 fi
 
 pipeline="$left"
@@ -570,6 +670,9 @@ fmt_ep() { # remote host path disk comp
   echo "$s"
 }
 
+# never print passwords in the plan
+pipeline_display="$(sed -E 's/SSHPASS=[^[:space:]]+ sshpass -e /sshpass /g' <<<"$pipeline")"
+
 echo >&2
 echo "${C_BOLD}================ PLAN ================${C_N}" >&2
 echo "  Source : $(fmt_ep "$SRC_REMOTE" "$SRC_HOST" "$SRC_PATH" "$SRC_DISK" "$SRC_COMP")" >&2
@@ -578,7 +681,7 @@ echo "  Dest   : $(fmt_ep "$DST_REMOTE" "$DST_HOST" "$DST_PATH" "$DST_DISK" "$CO
 [[ $DST_DISK -eq 0 && "$COMP" != "none" ]] && echo "  Comp   : $COMP level $LEVEL" >&2
 [[ -n "${WIRE_USED:-}" ]] && echo "  Wire   : transfer-compressed with $WIRE_USED (level 1)" >&2
 echo "  BS     : $BS" >&2
-echo "  Pipe   : $pipeline" >&2
+echo "  Pipe   : $pipeline_display" >&2
 echo "${C_BOLD}======================================${C_N}" >&2
 echo >&2
 
@@ -588,16 +691,14 @@ if [[ $DRY_RUN -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------- safety ----
-# destination size check for disk targets
 if [[ $DST_DISK -eq 1 && -n "$src_bytes" && "$stream_comp" == "none" && $SRC_DISK -eq 1 ]]; then
-  dst_bytes="$(get_size_bytes "$DST_REMOTE" "$DST_HOST" "$DST_PATH" 1)"
+  dst_bytes="$(get_size_bytes DST)"
   if [[ -n "$dst_bytes" && "$dst_bytes" -lt "$src_bytes" ]]; then
     warn "destination disk ($(human_size "$dst_bytes")) is SMALLER than source ($(human_size "$src_bytes")) - the copy will be truncated"
     [[ $ASSUME_YES -eq 1 ]] || ask_yn "Continue anyway?" "n" || die "aborted"
   fi
 fi
 
-# mounted checks + permissions
 if [[ $SRC_DISK -eq 1 && $SRC_REMOTE -eq 0 ]]; then
   [[ -r "$SRC_PATH" ]] || die "cannot read $SRC_PATH - run with sudo"
 fi
@@ -607,17 +708,16 @@ if [[ $DST_DISK -eq 1 ]]; then
     check_mounted_local "$DST_PATH"
     confirm_disk_write "$DST_PATH (local)" "$DST_PATH"
   else
-    check_mounted_remote "$DST_HOST" "$DST_PATH"
+    check_mounted_remote DST
     confirm_disk_write "$DST_PATH on $DST_HOST" "$DST_PATH"
   fi
 fi
 
-# create parent dir for local image dest
 if [[ $DST_DISK -eq 0 && $DST_REMOTE -eq 0 ]]; then
   mkdir -p "$(dirname "$DST_PATH")"
 fi
 if [[ $DST_DISK -eq 0 && $DST_REMOTE -eq 1 ]]; then
-  remote_run "$DST_HOST" "mkdir -p $(q "$(dirname "$DST_PATH")")" || true
+  remote_run DST "mkdir -p $(q "$(dirname "$DST_PATH")")" || true
 fi
 
 # ------------------------------------------------------------------- run ----
@@ -633,7 +733,6 @@ set -e
 elapsed=$(( SECONDS - t0 ))
 sync 2>/dev/null || true
 
-# checksum finalize
 if [[ -n "$SHA_TMP" ]]; then
   for _ in $(seq 1 50); do [[ -s "$SHA_TMP" ]] && break; sleep 0.1; done
   if [[ -s "$SHA_TMP" ]]; then
